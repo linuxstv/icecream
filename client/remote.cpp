@@ -27,7 +27,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #ifdef __FreeBSD__
 // Grmbl  Why is this needed?  We don't use readv/writev
@@ -229,9 +230,21 @@ get_absfilename(const string &_file)
     return file;
 }
 
+static int get_niceness()
+{
+    errno = 0;
+    int niceness = getpriority( PRIO_PROCESS, getpid());
+    if( niceness == -1 && errno != 0 )
+        niceness = 0;
+    return niceness;
+}
+
 static UseCSMsg *get_server(MsgChannel *local_daemon)
 {
-    Msg *umsg = local_daemon->get_msg(4 * 60);
+    int timeout = 4 * 60;
+    if( get_niceness() > 0 ) // low priority jobs may take longer to get a slot assigned
+        timeout = 60 * 60;
+    Msg *umsg = local_daemon->get_msg( timeout );
 
     if (!umsg || umsg->type != M_USE_CS) {
         log_warning() << "reply was not expected use_cs " << (umsg ? (char)umsg->type : '0')  << endl;
@@ -257,7 +270,7 @@ static void check_for_failure(Msg *msg, MsgChannel *cserver)
 
 // 'unlock_sending' = dcc_lock_host() is held when this is called, temporarily yield the lock
 // while doing network transfers
-static void write_fd_to_server(int fd, MsgChannel *cserver, bool unlock_sending = false)
+static void write_fd_to_server(int fd, MsgChannel *cserver)
 {
     unsigned char buffer[100000]; // some random but huge number
     off_t offset = 0;
@@ -287,13 +300,6 @@ static void write_fd_to_server(int fd, MsgChannel *cserver, bool unlock_sending 
 
         if (!bytes || offset == sizeof(buffer)) {
             if (offset) {
-                // If write_fd_to_server() is called for sending preprocessed data,
-                // the dcc_lock_host() lock is held to limit the number cpp invocations
-                // to the cores available to prevent overload. But that would
-                // essentially also limit network transfers, so temporarily yield and
-                // reaquire again.
-                if(unlock_sending)
-                    dcc_unlock();
                 FileChunkMsg fcmsg(buffer, offset);
 
                 if (!cserver->send_msg(fcmsg)) {
@@ -310,15 +316,6 @@ static void write_fd_to_server(int fd, MsgChannel *cserver, bool unlock_sending 
                 uncompressed += fcmsg.len;
                 compressed += fcmsg.compressed;
                 offset = 0;
-                if(unlock_sending)
-                {
-                    if(!dcc_lock_host())
-                    {
-                        log_error() << "can't reaquire lock for local cpp" << endl;
-                        close(fd);
-                        throw client_error(32, "Error 32 - lock failed");
-                    }
-                }
             }
 
             if (!bytes) {
@@ -452,6 +449,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
             EnvTransferMsg msg(job.targetPlatform(), job.environmentVersion());
 
+            if (!dcc_lock_host()) {
+                log_error() << "can't lock for local cpp" << endl;
+                return EXIT_DISTCC_FAILED;
+            }
+
             if (!cserver->send_msg(msg)) {
                 throw client_error(6, "Error 6 - send environment to remote failed");
             }
@@ -469,6 +471,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw client_error(8, "Error 8 - write environment to remote failed");
             }
 
+            dcc_unlock();
+
             if (IS_PROTOCOL_31(cserver)) {
                 VerifyEnvMsg verifymsg(job.targetPlatform(), job.environmentVersion());
 
@@ -482,9 +486,9 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     if (!static_cast<VerifyEnvResultMsg*>(verify_msg)->ok) {
                         // The remote can't handle the environment at all (e.g. kernel too old),
                         // mark it as never to be used again for this environment.
-                        log_info() << "Host " << hostname
-                                   << " did not successfully verify environment."
-                                   << endl;
+                        log_warning() << "Host " << hostname
+                                      << " did not successfully verify environment."
+                                      << endl;
                         BlacklistHostEnvMsg blacklist(job.targetPlatform(),
                                                       job.environmentVersion(), hostname);
                         local_daemon->send_msg(blacklist);
@@ -514,12 +518,17 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             job.appendFlag( job.language() == CompileJob::Lang_OBJC ? "objective-c" : "objective-c++", Arg_Remote );
         }
 
+        if (!dcc_lock_host()) {
+            log_error() << "can't lock for local cpp" << endl;
+            return EXIT_DISTCC_FAILED;
+        }
+
         CompileFileMsg compile_file(&job);
         {
             log_block b("send compile_file");
 
             if (!cserver->send_msg(compile_file)) {
-                log_info() << "write of job failed" << endl;
+                log_warning() << "write of job failed" << endl;
                 throw client_error(9, "Error 9 - error sending file to remote");
             }
         }
@@ -533,10 +542,6 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 throw client_error(32, "Error 18 - (fork error?)");
             }
 
-            if (!dcc_lock_host()) {
-                log_error() << "can't lock for local cpp" << endl;
-                return EXIT_DISTCC_FAILED;
-            }
             HostUnlock hostUnlock; // automatic dcc_unlock()
 
             /* This will fork, and return the pid of the child.  It will not
@@ -550,7 +555,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
             try {
                 log_block bl2("write_fd_to_server from cpp");
-                write_fd_to_server(sockets[0], cserver, true /*yield lock*/);
+                write_fd_to_server(sockets[0], cserver);
             } catch (...) {
                 kill(cpp_pid, SIGTERM);
                 throw;
@@ -586,9 +591,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         }
 
         if (!cserver->send_msg(EndMsg())) {
-            log_info() << "write of end failed" << endl;
+            log_warning() << "write of end failed" << endl;
             throw client_error(12, "Error 12 - failed to send file to remote");
         }
+
+        dcc_unlock();
 
         Msg *msg;
         {
@@ -615,21 +622,21 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
         if (status && crmsg->was_out_of_memory) {
             delete crmsg;
-            log_info() << "the server ran out of memory, recompiling locally" << endl;
+            log_warning() << "the server ran out of memory, recompiling locally" << endl;
             throw remote_error(101, "Error 101 - the server ran out of memory, recompiling locally");
         }
 
         if (output) {
             if ((!crmsg->out.empty() || !crmsg->err.empty()) && output_needs_workaround(job)) {
                 delete crmsg;
-                log_info() << "command needs stdout/stderr workaround, recompiling locally" << endl;
-                log_info() << "(set ICECC_CARET_WORKAROUND=0 to override)" << endl;
+                log_warning() << "command needs stdout/stderr workaround, recompiling locally" << endl;
+                log_warning() << "(set ICECC_CARET_WORKAROUND=0 to override)" << endl;
                 throw remote_error(102, "Error 102 - command needs stdout/stderr workaround, recompiling locally");
             }
 
             if (crmsg->err.find("file not found") != string::npos) {
                 delete crmsg;
-                log_info() << "remote is missing file, recompiling locally" << endl;
+                log_warning() << "remote is missing file, recompiling locally" << endl;
                 throw remote_error(104, "Error 104 - remote is missing file, recompiling locally");
             }
 
@@ -738,7 +745,7 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
         CompileFileMsg compile_file(&job);
 
         if (!local_daemon->send_msg(compile_file)) {
-            log_info() << "write of job failed" << endl;
+            log_warning() << "write of job failed" << endl;
             throw client_error(29, "Error 29 - write of job failed");
         }
 
@@ -859,7 +866,8 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         GetCSMsg getcs(envs, fake_filename, job.language(), torepeat,
                        job.targetPlatform(), job.argumentFlags(),
                        preferred_host ? preferred_host : string(),
-                       minimalRemoteVersion(job), requiredRemoteFeatures());
+                       minimalRemoteVersion(job), requiredRemoteFeatures(),
+                       get_niceness());
 
         trace() << "asking for host to use" << endl;
         if (!local_daemon->send_msg(getcs)) {
@@ -921,7 +929,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         GetCSMsg getcs(envs, get_absfilename(job.inputFile()), job.language(), torepeat,
                        job.targetPlatform(), job.argumentFlags(),
                        preferred_host ? preferred_host : string(),
-                       minimalRemoteVersion(job), 0);
+                       minimalRemoteVersion(job), 0, get_niceness());
 
 
         if (!local_daemon->send_msg(getcs)) {

@@ -36,7 +36,7 @@
 #include "job.h"
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
-#define PROTOCOL_VERSION 42
+#define PROTOCOL_VERSION 44
 // if you increase the MIN_PROTOCOL_VERSION, comment out macros below and clean up the code
 #define MIN_PROTOCOL_VERSION 21
 
@@ -67,6 +67,8 @@
 #define IS_PROTOCOL_40(c) ((c)->protocol >= 40)
 #define IS_PROTOCOL_41(c) ((c)->protocol >= 41)
 #define IS_PROTOCOL_42(c) ((c)->protocol >= 42)
+#define IS_PROTOCOL_43(c) ((c)->protocol >= 43)
+#define IS_PROTOCOL_44(c) ((c)->protocol >= 44)
 
 // Terms used:
 // S  = scheduler
@@ -418,13 +420,16 @@ public:
         , count(1)
         , arg_flags(0)
         , client_id(0)
-        , client_count(0) {}
+        , client_count(0)
+        , niceness(0)
+        {}
 
     GetCSMsg(const Environments &envs, const std::string &f,
              CompileJob::Language _lang, unsigned int _count,
              std::string _target, unsigned int _arg_flags,
              const std::string &host, int _minimal_host_version,
              unsigned int _required_features,
+             int _niceness,
              unsigned int _client_count = 0);
 
     virtual void fill_from_channel(MsgChannel *c);
@@ -441,6 +446,7 @@ public:
     int minimal_host_version;
     uint32_t required_features;
     uint32_t client_count; // number of CS -> C connections at the moment
+    uint32_t niceness; // nice priority (0-20)
 };
 
 class UseCSMsg : public Msg
@@ -680,11 +686,12 @@ public:
 class JobLocalBeginMsg : public Msg
 {
 public:
-    JobLocalBeginMsg(int job_id = 0, const std::string &file = "")
+    JobLocalBeginMsg(int job_id = 0, const std::string &file = "", bool full = false)
         : Msg(M_JOB_LOCAL_BEGIN)
         , outfile(file)
         , stime(time(0))
-        , id(job_id) {}
+        , id(job_id)
+        , fulljob(full) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -692,6 +699,7 @@ public:
     std::string outfile;
     uint32_t stime;
     uint32_t id;
+    bool fulljob;
 };
 
 class JobLocalDoneMsg : public Msg
@@ -822,7 +830,7 @@ public:
     }
 
     MonGetCSMsg(int jobid, int hostid, GetCSMsg *m)
-        : GetCSMsg(Environments(), m->filename, m->lang, 1, m->target, 0, std::string(), false, m->client_count)
+        : GetCSMsg(Environments(), m->filename, m->lang, 1, m->target, 0, std::string(), false, m->client_count, m->niceness)
         , job_id(jobid)
         , clientid(hostid)
     {

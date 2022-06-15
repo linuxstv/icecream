@@ -976,6 +976,11 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
 #endif
     }
 
+#ifdef TCP_USER_TIMEOUT
+    int timeout = 3 * 3 * 1000; // matches the timeout part of keepalive above, in milliseconds
+    setsockopt(_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout));
+#endif
+
     if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
         log_perror("MsgChannel fcntl()");
     }
@@ -1923,6 +1928,7 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
      std::string _target, unsigned int _arg_flags,
      const std::string &host, int _minimal_host_version,
      unsigned int _required_features,
+     int _niceness,
      unsigned int _client_count)
     : Msg(M_GET_CS)
     , versions(envs)
@@ -1936,10 +1942,12 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
     , minimal_host_version(_minimal_host_version)
     , required_features(_required_features)
     , client_count(_client_count)
+    , niceness(_niceness)
 {
     // These have been introduced in protocol version 42.
     if( required_features & ( NODE_FEATURE_ENV_XZ | NODE_FEATURE_ENV_ZSTD ))
         minimal_host_version = max( minimal_host_version, 42 );
+    assert( _niceness >= 0 && _niceness <= 20 );
 }
 
 void GetCSMsg::fill_from_channel(MsgChannel *c)
@@ -1983,6 +1991,11 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     if (IS_PROTOCOL_42(c)) {
         *c >> required_features;
     }
+
+    niceness = 0;
+    if (IS_PROTOCOL_43(c)) {
+        *c >> niceness;
+    }
 }
 
 void GetCSMsg::send_to_channel(MsgChannel *c) const
@@ -2012,6 +2025,9 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
     }
     if (IS_PROTOCOL_42(c)) {
         *c << required_features;
+    }
+    if (IS_PROTOCOL_43(c)) {
+        *c << niceness;
     }
 }
 
@@ -2265,6 +2281,11 @@ void JobLocalBeginMsg::fill_from_channel(MsgChannel *c)
     *c >> stime;
     *c >> outfile;
     *c >> id;
+    if (IS_PROTOCOL_44(c)) {
+        uint32_t full;
+        *c >> full;
+        fulljob = full;
+    }
 }
 
 void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
@@ -2273,6 +2294,9 @@ void JobLocalBeginMsg::send_to_channel(MsgChannel *c) const
     *c << stime;
     *c << outfile;
     *c << id;
+    if (IS_PROTOCOL_44(c)) {
+        *c << (uint32_t) fulljob;
+    }
 }
 
 void JobLocalDoneMsg::fill_from_channel(MsgChannel *c)
